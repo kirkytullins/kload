@@ -4,32 +4,33 @@ require 'fileutils'
 require "http/parser"
 require 'zlib'
 require 'stringio'
+require 'digest/sha1'
 # require 'json'
 
 
 $db = {}
 
 $g_cnt = 1
+$g_ord = 1
 
 def save_db
-	File.open("db_#{ARGV[2]}.yaml", 'w'){|f| f.write YAML.dump($db) }
+	File.open("recordings/#{ARGV[0]}_#{ARGV[1]}/db_#{ARGV[2]}.yaml", 'w'){|f| f.write YAML.dump($db) }
 end
 
 
 def gunzip(data)
-    io = StringIO.new(data, "rb")
-    gz = Zlib::GzipReader.new(io)
-    decompressed = gz.read
-  end
+  io = StringIO.new(data, "rb")
+  gz = Zlib::GzipReader.new(io)
+  decompressed = gz.read
+end
   
 def gzip(string)
-    wio = StringIO.new("w")
-    w_gz = Zlib::GzipWriter.new(wio)
-    w_gz.write(string)
-    w_gz.close
-    compressed = wio.string
+  wio = StringIO.new("w")
+  w_gz = Zlib::GzipWriter.new(wio)
+  w_gz.write(string)
+  w_gz.close
+  compressed = wio.string
 end
-
 
 # system under test server listens on port 9293
 # client sends requests on em-proxy (9292) which then forwards them to system ARGV[0] and port ARGV[1]
@@ -40,7 +41,7 @@ abort("forwarding server not given") unless ARGV[0]
 abort("forwarding port not given") unless ARGV[1]
 abort("recording name not given") unless ARGV[2]
 
-$root_path = "recordings/#{ARGV[2]}"
+$root_path = "recordings/#{ARGV[0]}_#{ARGV[1]}/#{ARGV[2]}"
 FileUtils.mkdir_p($root_path)
 
 def parse_server_response(data)
@@ -133,8 +134,18 @@ Proxy.start(:host => "0.0.0.0", :port => 9292, :debug => false) do |conn|
   	@ts = Time.now.to_f.to_s
   	$db[@ts] =  { :socket => conn.peer[1], :req => parse_client_request(data), :ts => Time.now.to_f , :resp_time => 0.0}  	
   	$db[@ts][:resp] = []
-    @request = "#{$db[@ts][:req][:url]}".gsub!(/[^0-9A-Za-z.\-]/, '_')
-    @filename = "#{$root_path}/#{conn.peer[1]}_#{@ts}_#{@request}"
+    sha1 = Digest::SHA1.hexdigest $db[@ts][:req][:url]
+    @request = "#{@ts}_#{conn.peer[1]}_#{sha1}_#{$db[@ts][:req][:url].split('?')[0]}".gsub!(/[^0-9A-Za-z.\-]/, '_')
+    # @filename = "#{$root_path}/#{@request}_#{conn.peer[1]}_#{@ts}"
+    @filename =  "#{$root_path}/%05d_" % $g_ord + "#{@request}"
+    $g_ord += 1
+    @header_parsed = false
+    if File.exists?(@filename)
+      # puts "file #{@filename} exists : adding suffix"
+      # @filename = @filename + "_#{$g_cnt}"
+      puts "file #{@filename} exists : overwriting"      
+      $g_cnt +=1
+    end
     # p [:on_data, data]    
     # m = data.match(/admin_command\=(.*)/)
     # if m 
@@ -147,33 +158,47 @@ Proxy.start(:host => "0.0.0.0", :port => 9292, :debug => false) do |conn|
     # 	conn.send_data "INSERTED command #{m[1]}\r\n"
     #   data = nil
     # else
-    	data  
+    # require 'pry'
+    # binding.pry
+
+    data.gsub!("Accept-Encoding: gzip, deflate, sdch\r\n","")
+    data
     # end 	
   	
   end
 
   # modify / process response stream
   conn.on_response do |backend, resp|
-    p [:on_response, backend, resp.size, conn.peer[1]]
+    p [:on_response, backend, resp.size, conn.peer[1], @filename]
 
-    d = parse_server_response(resp)
+    # d = parse_server_response(resp)
     #write the response in the file and set the file name in the body
-    if !@filename && d[:headers] 
+    # if !@filename && d[:headers] 
       # require 'pry'
       # binding.pry      
-      gzip = ".zip" #if d[:headers]["Content-Encoding"].match(/gzip/) rescue false
-    end
+      # gzip = ".zip" #if d[:headers]["Content-Encoding"].match(/gzip/) rescue false
+    # end
     # request = "#{$db[@ts][:req][:url].split('?')[0]}#{gzip}".gsub("\/","_")
     
-    
     # File.open(filename,"ab+"){|f| f.write d[:body] }
-    File.open(@filename,"ab+"){|f| f.write resp }
+    resp_headers = "NO HEADERS\r\n"
+    if !@header_parsed 
+      resp_headers = resp.split("\r\n\r\n")[0] rescue "NO HEADERS\r\n"
+      body = resp.split("\r\n\r\n")[1..-1].join("\r\n\r\n") rescue "??"
+      @header_parsed = true
+    else
 
-    d[:body] = @filename +  $g_cnt.to_s
-    $g_cnt += 1
+      body = resp  
+    end  
 
-    $db[@ts][:resp]  << {:ts => Time.now.to_f, :size => resp.size}.merge(d)
+    File.open(@filename,"ab+"){|f| f.write body }
+
+    # d[:body] = @filename +  $g_cnt.to_s
+    # $g_cnt += 1
+
+    $db[@ts][:resp]  << {:resp_headers => resp_headers.split("\r\n"), :ts => Time.now.to_f, :size => resp.size, :body => @filename}
     $db[@ts][:resp_time] = $db[@ts][:resp_time] + (Time.now.to_f - $db[@ts][:ts] )
+
     resp
   end
 
