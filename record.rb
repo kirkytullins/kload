@@ -2,6 +2,9 @@ require 'em-proxy'
 require 'yaml'
 require 'fileutils'
 require "http/parser"
+require 'zlib'
+require 'stringio'
+# require 'json'
 
 
 $db = {}
@@ -10,6 +13,21 @@ $g_cnt = 1
 
 def save_db
 	File.open("db_#{ARGV[2]}.yaml", 'w'){|f| f.write YAML.dump($db) }
+end
+
+
+def gunzip(data)
+    io = StringIO.new(data, "rb")
+    gz = Zlib::GzipReader.new(io)
+    decompressed = gz.read
+  end
+  
+def gzip(string)
+    wio = StringIO.new("w")
+    w_gz = Zlib::GzipWriter.new(wio)
+    w_gz.write(string)
+    w_gz.close
+    compressed = wio.string
 end
 
 
@@ -28,7 +46,7 @@ FileUtils.mkdir_p($root_path)
 def parse_server_response(data)
   begin 
     parser = Http::Parser.new
-    ret = {}
+    ret = {:status => nil, :headers => nil, :body => nil}
 
     parser.on_headers_complete = proc do
       ret[:status] = parser.status_code # for responses
@@ -36,9 +54,17 @@ def parse_server_response(data)
     end
 
     parser.on_body = proc do |chunk|
+
       # One chunk of the body
       # p chunk
-      ret[:body] = chunk
+      if ret[:body]
+        ret[:body] = ret[:body] + chunk 
+        p "append in body, size : #{chunk.size}"
+      else
+        ret[:body] = chunk
+        p "in body, size : #{chunk.size}"
+      end
+
     end
 
     parser.on_message_complete = proc do |env|
@@ -52,6 +78,8 @@ def parse_server_response(data)
    rescue Exception => e
      p e.message
      ret[:body] = data
+     # require 'pry'
+     # binding.pry
      return ret
    end
 end
@@ -99,9 +127,14 @@ Proxy.start(:host => "0.0.0.0", :port => 9292, :debug => false) do |conn|
 
   # modify / process request stream
   conn.on_data do |data|
+    @filename = nil
+    @gzip = ""
+
   	@ts = Time.now.to_f.to_s
   	$db[@ts] =  { :socket => conn.peer[1], :req => parse_client_request(data), :ts => Time.now.to_f , :resp_time => 0.0}  	
   	$db[@ts][:resp] = []
+    @request = "#{$db[@ts][:req][:url]}".gsub!(/[^0-9A-Za-z.\-]/, '_')
+    @filename = "#{$root_path}/#{conn.peer[1]}_#{@ts}_#{@request}"
     # p [:on_data, data]    
     # m = data.match(/admin_command\=(.*)/)
     # if m 
@@ -121,16 +154,24 @@ Proxy.start(:host => "0.0.0.0", :port => 9292, :debug => false) do |conn|
 
   # modify / process response stream
   conn.on_response do |backend, resp|
-    p [:on_response, backend, resp.size]
+    p [:on_response, backend, resp.size, conn.peer[1]]
 
     d = parse_server_response(resp)
     #write the response in the file and set the file name in the body
-    request = "#{$db[@ts][:req][:url].split('?')[0]}_#{$g_cnt}".gsub("\/","_")
+    if !@filename && d[:headers] 
+      # require 'pry'
+      # binding.pry      
+      gzip = ".zip" #if d[:headers]["Content-Encoding"].match(/gzip/) rescue false
+    end
+    # request = "#{$db[@ts][:req][:url].split('?')[0]}#{gzip}".gsub("\/","_")
     
-    filename = "#{$root_path}/#{@ts}_#{request}"
+    
+    # File.open(filename,"ab+"){|f| f.write d[:body] }
+    File.open(@filename,"ab+"){|f| f.write resp }
+
+    d[:body] = @filename +  $g_cnt.to_s
     $g_cnt += 1
-    File.open(filename,"w"){|f| f.write d[:body] }
-    d[:body] = filename
+
     $db[@ts][:resp]  << {:ts => Time.now.to_f, :size => resp.size}.merge(d)
     $db[@ts][:resp_time] = $db[@ts][:resp_time] + (Time.now.to_f - $db[@ts][:ts] )
     resp
