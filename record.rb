@@ -12,29 +12,30 @@ $db = {}
 $g_cnt = 1
 
 def save_db
-	File.open("db_#{ARGV[2]}.yaml", 'w'){|f| f.write YAML.dump($db) }
+  File.open("db_#{ARGV[2]}.yaml", 'w'){|f| f.write YAML.dump($db) }
 end
 
 
 def gunzip(data)
-    io = StringIO.new(data, "rb")
-    gz = Zlib::GzipReader.new(io)
-    decompressed = gz.read
-  end
+  io = StringIO.new(data, "rb")
+  gz = Zlib::GzipReader.new(io)
+  decompressed = gz.read
+end
   
 def gzip(string)
-    wio = StringIO.new("w")
-    w_gz = Zlib::GzipWriter.new(wio)
-    w_gz.write(string)
-    w_gz.close
-    compressed = wio.string
+  wio = StringIO.new("w")
+  w_gz = Zlib::GzipWriter.new(wio)
+  w_gz.write(string)
+  w_gz.close
+  compressed = wio.string
 end
 
 
 # system under test server listens on port 9293
 # client sends requests on em-proxy (9292) which then forwards them to system ARGV[0] and port ARGV[1]
-# if a request comes to port 9999 then it will be interpreted as a command to insert into
-# the flow of the script, it will be inserted literally and not response will be sent back ??
+# if a request matches 'admin_command' it will be interpreted as a command to insert into
+# the flow of the script - with a new timestamp, it will be inserted literally and a response will be sent back with message
+# INSERTED xxx 
 
 abort("forwarding server not given") unless ARGV[0]
 abort("forwarding port not given") unless ARGV[1]
@@ -54,9 +55,6 @@ def parse_server_response(data)
     end
 
     parser.on_body = proc do |chunk|
-
-      # One chunk of the body
-      # p chunk
       if ret[:body]
         ret[:body] = ret[:body] + chunk 
         p "append in body, size : #{chunk.size}"
@@ -64,7 +62,6 @@ def parse_server_response(data)
         ret[:body] = chunk
         p "in body, size : #{chunk.size}"
       end
-
     end
 
     parser.on_message_complete = proc do |env|
@@ -95,8 +92,6 @@ def parse_client_request(data)
     end
 
     parser.on_body = proc do |chunk|
-      # One chunk of the body
-      # p chunk
       ret[:body] = chunk
     end
 
@@ -115,7 +110,6 @@ def parse_client_request(data)
    end
 end
 
-
 puts "==> forwarding to #{ARGV[0]}:#{ARGV[1]}"
 
 Proxy.start(:host => "0.0.0.0", :port => 9292, :debug => false) do |conn|
@@ -130,8 +124,8 @@ Proxy.start(:host => "0.0.0.0", :port => 9292, :debug => false) do |conn|
     @filename = nil
     @gzip = ""
 
-  	@ts = Time.now.to_f.to_s
-  	$db[@ts] =  { :socket => conn.peer[1], :req => parse_client_request(data), :ts => Time.now.to_f , :resp_time => 0.0}  	
+    @ts = Time.now.to_f.to_s
+    $db[@ts] =  { :socket => conn.peer[1], :req => parse_client_request(data), :ts => Time.now.to_f , :resp_time => 0.0}  	
   	$db[@ts][:resp] = []
     @request = "#{$db[@ts][:req][:url]}".gsub!(/[^0-9A-Za-z.\-]/, '_')
     @filename = "#{$root_path}/#{conn.peer[1]}_#{@ts}_#{@request}"
