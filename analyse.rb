@@ -63,7 +63,7 @@ end
 
 abort("recording name not given") unless ARGV[0]
 
-a = Analyzer.new("db_#{ARGV[0]}.yaml")
+a = Analyzer.new("#{ARGV[0]}")
 # puts "response time and sizes for #{ARGV[0]}"
 r = a.response_times
 puts r[0].keys.join(",")

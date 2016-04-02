@@ -7,29 +7,64 @@ require 'stringio'
 require 'digest/sha1'
 # require 'json'
 
+require 'logger'
+
 
 $db = {}
+$db_data = {}
 
-$g_cnt = 1
-$g_ord = 1
+$enter = "enter"
+
+# $g_cnt = 1
+$g_ord = {}
+
+$g_order_glob = 1
+
+logger = Logger.new(STDOUT)
+logger.level = Logger::WARN
+
+def save_html_table
+
+end  
+
 
 def save_db
-	File.open("recordings/#{ARGV[0]}_#{ARGV[1]}/db_#{ARGV[2]}.yaml", 'w'){|f| f.write YAML.dump($db) }
-end
 
+	File.open("recordings/#{ARGV[0]}_#{ARGV[1]}/db_#{ARGV[2]}.yaml", 'w'){|f| f.write YAML.dump($db) }
+  
+  root_uncomp = $root_path + "_uncomp"
+  FileUtils.mkdir_p root_uncomp
+  # go through each of the requests and save the file 
+  $db.each do |k, v|
+    if !File.exists? v[:filename]
+      # write the file in the usual place
+      File.open(v[:filename],"wb+"){|f| f.write $db_data[k]}        
+      # if it ends with .gz, unzip it and write it to the _uncomp folder
+      # if not just copy it to the unzipped folder 
+      if v[:filename].match /\.gz$/
+        unzipped_fn = File.join(root_uncomp,File.basename(v[:filename].gsub(/\.gz$/, "")))
+        begin 
+          unzipped_data = gunzip($db_data[k])
+        rescue => exception 
+          puts "=== #{File.basename(v[:filename])} === "
+          puts exception.backtrace
+          # raise
+        end        
+        File.open(unzipped_fn,"wb+"){|f| f.write unzipped_data}    
+      else
+        FileUtils.cp v[:filename], File.join(root_uncomp,File.basename(v[:filename]))
+      end
+    end  
+
+  end
+
+  save_html_table
+end
 
 def gunzip(data)
   io = StringIO.new(data, "rb")
   gz = Zlib::GzipReader.new(io)
   decompressed = gz.read
-end
-  
-def gzip(string)
-  wio = StringIO.new("w")
-  w_gz = Zlib::GzipWriter.new(wio)
-  w_gz.write(string)
-  w_gz.close
-  compressed = wio.string
 end
 
 # system under test server listens on port 9293
@@ -44,78 +79,20 @@ abort("recording name not given") unless ARGV[2]
 $root_path = "recordings/#{ARGV[0]}_#{ARGV[1]}/#{ARGV[2]}"
 FileUtils.mkdir_p($root_path)
 
-def parse_server_response(data)
-  begin 
-    parser = Http::Parser.new
-    ret = {:status => nil, :headers => nil, :body => nil}
 
-    parser.on_headers_complete = proc do
-      ret[:status] = parser.status_code # for responses
-      ret[:headers] = parser.headers        
-    end
-
-    parser.on_body = proc do |chunk|
-
-      # One chunk of the body
-      # p chunk
-      if ret[:body]
-        ret[:body] = ret[:body] + chunk 
-        p "append in body, size : #{chunk.size}"
-      else
-        ret[:body] = chunk
-        p "in body, size : #{chunk.size}"
-      end
-
-    end
-
-    parser.on_message_complete = proc do |env|
-      # Headers and body is all parsed
-      # puts "Done!"
-      # return ret
-    end
-
-    parser << data
-    return ret
-   rescue Exception => e
-     p e.message
-     ret[:body] = data
-     # require 'pry'
-     # binding.pry
-     return ret
-   end
+def manage_admin(ts, data)
+  m = data.match(/admin_command\=(.*)/)
+  if m 
+    logger.info [:on_command, "#{m}"]
+    # insert the command here in the flow of the script
+    #data is the actual command which would be evaled later at replay Time
+    $db[ts][:req] = m[1]
+    $db[ts][:resp] = ["ADMIN"]     
+    conn.send_data "INSERTED command #{m[1]}\r\n"
+    data = nil
+  end  
+  return data
 end
-
-def parse_client_request(data)
-  begin 
-    parser = Http::Parser.new
-    ret = {}
-    parser.on_headers_complete = proc do
-      ret[:method] = parser.http_method
-      ret[:url] = parser.request_url      
-      ret[:headers] = parser.headers        
-    end
-
-    parser.on_body = proc do |chunk|
-      # One chunk of the body
-      # p chunk
-      ret[:body] = chunk
-    end
-
-    parser.on_message_complete = proc do |env|
-      # Headers and body is all parsed
-      # puts "Done!"
-      # return ret
-    end
-
-    parser << data
-    return ret
-   rescue Exception => e
-     p e.message
-     ret[:body] = data
-     return ret
-   end
-end
-
 
 puts "==> forwarding to #{ARGV[0]}:#{ARGV[1]}"
 
@@ -123,88 +100,122 @@ Proxy.start(:host => "0.0.0.0", :port => 9292, :debug => false) do |conn|
   conn.server :srv, :host => ARGV[0], :port => ARGV[1].to_i
 
   conn.on_connect do |data,b|
-    puts [:on_connect, data, b].inspect
+   
+    logger.info [:on_connect, data, b, conn.peer[1], conn.signature, $g_order_glob]
   end
 
   # modify / process request stream
   conn.on_data do |data|
-    @filename = nil
-    @gzip = ""
+    $g_order_glob += 1
 
-  	@ts = Time.now.to_f.to_s
-  	$db[@ts] =  { :socket => conn.peer[1], :req => parse_client_request(data), :ts => Time.now.to_f , :resp_time => 0.0}  	
-  	$db[@ts][:resp] = []
-    sha1 = Digest::SHA1.hexdigest $db[@ts][:req][:url]
-    @request = "#{@ts}_#{conn.peer[1]}_#{sha1}_#{$db[@ts][:req][:url].split('?')[0]}".gsub!(/[^0-9A-Za-z.\-]/, '_')
-    # @filename = "#{$root_path}/#{@request}_#{conn.peer[1]}_#{@ts}"
-    @filename =  "#{$root_path}/%05d_" % $g_ord + "#{@request}"
-    $g_ord += 1
-    @header_parsed = false
-    if File.exists?(@filename)
-      # puts "file #{@filename} exists : adding suffix"
-      # @filename = @filename + "_#{$g_cnt}"
-      puts "file #{@filename} exists : overwriting"      
-      $g_cnt +=1
+    $g_ord[conn.peer[1]] = $g_ord[conn.peer[1]] ? $g_ord[conn.peer[1]] += 1 : $g_ord[conn.peer[1]] = 1
+   
+    parser = Http::Parser.new
+    ret = {:method => nil, :url => nil, :headers => nil}
+    parser.on_headers_complete = proc do
+      ret[:method] = parser.http_method
+      ret[:url] = parser.request_url      
+      ret[:headers] = parser.headers        
     end
-    # p [:on_data, data]    
-    # m = data.match(/admin_command\=(.*)/)
-    # if m 
-    # 	puts "command given = #{m}"
-    # 	# insert the command here in the flow of the script
-    # 	#data is the actual command which would be evaled later at replay Time
-    # 	$db[@ts][:req] = m[1]
-    # 	$db[@ts][:resp] = ["ADMIN"]    	
+    parser.on_body = proc do |chunk|
+      ret[:body] = ret[:body] ? ret[:body] << chunk : chunk
+    end
+    begin 
+      parser << data    
+    rescue Exception => e
+      p e.message
+      # ret[:body] = data      
+    end
+  
+    # @request = "#{req[:url].split('?')[0]}".gsub!(/[^0-9A-Za-z.\-]/, '_')    
+    @request = "#{ret[:url]}".gsub!(/[^0-9A-Za-z.\-]/, '_')    
+    
+    ts = "#{conn.peer[1]}_#{$g_ord[conn.peer[1]]}"
+    if $db[ts]
+      abort "ts #{ts} exists !!!"
+    end
 
-    # 	conn.send_data "INSERTED command #{m[1]}\r\n"
-    #   data = nil
-    # else
-    # require 'pry'
-    # binding.pry
+    filename = "#{$root_path}/%s_" % ts + "_#{@request}"
+    
+    $db[ts] =  { :order => $g_order_glob, :socket => conn.peer[1], :req => ret, :ts => Time.now.to_f , :resp_time => 0.0}   
+    # $db_data[ts] = ""
+    $db[ts][:filename] = filename
 
-    data.gsub!("Accept-Encoding: gzip, deflate, sdch\r\n","")
+    $db[ts][:header_parsed] = false
+
+    $db[ts][:resp] = []
+   
+    # manage the admin commands arriving through the same chanel 
+    # data = manage_admin(ts,data)
+
+    #uncomment to not accept gzipped content
+    # data.gsub!("Accept-Encoding: gzip, deflate, sdch\r\n","")    
+    data.gsub!(/Accept-Encoding:(.*)\r\n$/, "")
+    # data.gsub!("Connection: keep-alive","Connection: Close")
+    logger.info [:on_data, ts] 
+
     data
-    # end 	
-  	
+    
   end
 
   # modify / process response stream
   conn.on_response do |backend, resp|
-    p [:on_response, backend, resp.size, conn.peer[1], @filename]
+  
+    ts = "#{conn.peer[1]}_#{$g_ord[conn.peer[1]]}"
 
-    # d = parse_server_response(resp)
-    #write the response in the file and set the file name in the body
-    # if !@filename && d[:headers] 
-      # require 'pry'
-      # binding.pry      
-      # gzip = ".zip" #if d[:headers]["Content-Encoding"].match(/gzip/) rescue false
-    # end
-    # request = "#{$db[@ts][:req][:url].split('?')[0]}#{gzip}".gsub("\/","_")
-    
-    # File.open(filename,"ab+"){|f| f.write d[:body] }
-    resp_headers = "NO HEADERS\r\n"
-    if !@header_parsed 
-      resp_headers = resp.split("\r\n\r\n")[0] rescue "NO HEADERS\r\n"
-      body = resp.split("\r\n\r\n")[1..-1].join("\r\n\r\n") rescue "??"
-      @header_parsed = true
-    else
+    logger.info [:on_response, resp.size, ts]
 
-      body = resp  
+    headers_size = 0
+    body_size = 0
+    ret = {:status => nil, :headers => nil, :body => nil}
+    parser = nil
+    if !$db[ts][:header_parsed]
+
+      parser = Http::Parser.new      
+      parser.on_headers_complete = proc do
+        ret[:status] = parser.status_code 
+        ret[:headers] = parser.headers        
+      end
+      parser.on_body = proc do |chunk|
+        ret[:body] = ret[:body] ? ret[:body] << chunk : chunk
+      end
+      parser << resp.clone    
+
+      # File.open($db[ts][:filename],"ab+"){|f| f.write ret[:body] }
+      $db_data[ts] = ret[:body]
+      # File.open($db[ts][:filename],"ab+"){|f| f.write ret[:body] }
+  
+      if ret[:headers]["Content-Encoding"] == "gzip"
+        $db[ts][:filename] =  $db[ts][:filename] + ".gz" 
+      end  
+        $db[ts][:header_parsed] = true
+    else      
+      if $db_data[ts]
+        $db_data[ts] << resp 
+      else
+        $db_data[ts] = resp 
+      end
     end  
 
-    File.open(@filename,"ab+"){|f| f.write body }
+    # update yaml for the response
+    if ret[:headers]
+      $db[ts][:resp]  = [{:status => ret[:status], :resp_headers => ret[:headers]}]
+    end
 
-    # d[:body] = @filename +  $g_cnt.to_s
-    # $g_cnt += 1
+    # update timestamps
+    $db[ts][:resp]  << {:ts => Time.now.to_f, :size => resp.size}
+    
+    # update resp_time
+    $db[ts][:resp_time] = $db[ts][:resp_time] + (Time.now.to_f - $db[ts][:ts] )
 
-    $db[@ts][:resp]  << {:resp_headers => resp_headers.split("\r\n"), :ts => Time.now.to_f, :size => resp.size, :body => @filename}
-    $db[@ts][:resp_time] = $db[@ts][:resp_time] + (Time.now.to_f - $db[@ts][:ts] )
+    
 
     resp
   end
 
   # termination logic
   conn.on_finish do |backend, name|
-    p [:on_finish, name]
+    logger.info [:on_finish, name]
     # terminate connection (in duplex mode, you can terminate when prod is done)
     unbind if backend == :srv
     save_db
